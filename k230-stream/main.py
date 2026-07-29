@@ -1,130 +1,90 @@
 # -*- coding: utf-8 -*-
 # K230D 实时图传 — 立创庐山派 Lite K230D
-# 方案：GC2093 → H.264硬编码 → RTSP → WiFi AP
-# 推流地址：rtsp://<K230D_IP>:8554/ball
+# 方案：GC2093 → JPEG压缩 → MJPEG over HTTP → WiFi AP
+# 观看方式：PC连WiFi热点后，浏览器打开 http://<IP>
+#           VLC打开 http://<IP>/stream
 
 import os, time, gc
 import network
-import _thread
-import multimedia as mm
-from media.vencoder import *
+import usocket
 from media.sensor import *
-from media.media import *
 from media.display import *
+from media.media import *
 
 # ===== 可调参数 =====
-WIDTH   = 1280
-HEIGHT  = 720
-PORT    = 8554
-SESSION = "ball"
+WIDTH  = 640
+HEIGHT = 360
+PORT   = 80
 
 AP_SSID     = "K230D_Ball"
 AP_PASSWORD = "12345678"
 
-# H.264 编码参数
-ENC_PROFILE = Encoder.H264_PROFILE_MAIN  # 备选 H264_PROFILE_HIGH
-ENC_BITRATE = 2 * 1024 * 1024            # 2 Mbps
+JPEG_QUALITY = 35  # JPEG质量 1-100，越小体积越小延迟越低
 # ======================
 
+MJPEG_BOUNDARY = "--K230_FRAME"
+MJPEG_HEADER = (
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: multipart/x-mixed-replace; boundary=K230_FRAME\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+).encode()
 
-class RtspServer:
-    def __init__(self, session_name="ball", port=8554,
-                 video_type=mm.multi_media_type.media_h264):
-        self.session_name = session_name
-        self.video_type   = video_type
-        self.port         = port
-        self.server       = mm.rtsp_server()
-        self.start_stream = False
-        self.runthread_over = False
+HTML_PAGE = (
+    "<!DOCTYPE html>\n"
+    "<html><head><meta charset=\"UTF-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>K230D 图传</title></head>\n"
+    "<body style=\"margin:0;background:#1a1a2e;text-align:center\">\n"
+    "<h3 style=\"color:#eee;padding-top:8px\">K230D 实时图传</h3>\n"
+    "<img src=\"/stream\""
+    " style=\"width:100%;max-width:640px;border:2px solid #333\">\n"
+    "<p style=\"color:#888;font-size:12px\">MJPEG 低延迟实时画面</p>\n"
+    "</body></html>"
+).encode()
 
-    # ---- 启动 / 停止 ----
+HTML_HEADER = (
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: text/html; charset=utf-8\r\n"
+    "Content-Length: %d\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+) % len(HTML_PAGE)
 
-    def start(self):
-        self._init_stream()
-        self.server.rtspserver_init(self.port)
-        self.server.rtspserver_createsession(self.session_name,
-                                              self.video_type, False)
-        self.server.rtspserver_start()
-        self._start_stream()
-        self.start_stream = True
-        _thread.start_new_thread(self._do_rtsp_stream, ())
 
-    def stop(self):
-        if not self.start_stream:
-            return
-        self.start_stream = False
-        while not self.runthread_over:
-            time.sleep(0.1)
-        self._stop_stream()
-        self.server.rtspserver_stop()
-        self.server.rtspserver_deinit()
-
-    def get_url(self):
-        return self.server.rtspserver_getrtspurl(self.session_name)
-
-    # ---- 内部管线 ----
-
-    def _init_stream(self):
-        w = ALIGN_UP(WIDTH, 16)
-        # Sensor
-        self.sensor = Sensor()
-        self.sensor.reset()
-        self.sensor.set_framesize(width=w, height=HEIGHT, alignment=12)
-        self.sensor.set_pixformat(Sensor.YUV420SP)
-
-        # H.264 硬编码器
-        self.encoder = Encoder()
-        self.encoder.SetOutBufs(8, w, HEIGHT)
-        chn = ChnAttrStr(self.encoder.PAYLOAD_TYPE_H264,
-                         ENC_PROFILE, w, HEIGHT)
-        self.encoder.Create(chn)
-
-        # 绑定 Sensor → Encoder
-        src = self.sensor.bind_info()['src']
-        dst = (VIDEO_ENCODE_MOD_ID, VENC_DEV_ID, self.encoder.chn)
-        self.link = MediaManager.link(src, dst)
-
-    def _start_stream(self):
-        self.encoder.Start()
-        self.sensor.run()
-
-    def _stop_stream(self):
-        self.sensor.stop()
-        del self.link
-        self.encoder.Stop()
-        self.encoder.Destroy()
-
-    def _do_rtsp_stream(self):
-        """推流线程：循环取编码帧→发送"""
+def send_all(sock, data):
+    """确保全部数据发送完毕"""
+    total = 0
+    while total < len(data):
         try:
-            sd = StreamData()
-            while self.start_stream:
-                os.exitpoint()
-                self.encoder.GetStream(sd)
-                for i in range(sd.pack_cnt):
-                    data = bytes(uctypes.bytearray_at(sd.data[i],
-                                                       sd.data_size[i]))
-                    self.server.rtspserver_sendvideodata(
-                        self.session_name, data, sd.data_size[i], 1000)
-                self.encoder.ReleaseStream(sd)
-        except BaseException as e:
-            import sys
-            sys.print_exception(e)
-        finally:
-            self.runthread_over = True
+            sent = sock.send(data[total:])
+            if sent <= 0:
+                return False
+            total += sent
+        except OSError:
+            return False
+    return True
 
 
-# ===== WiFi AP 热点 =====
+def build_mjpeg_frame(jpeg_data):
+    """构造 MJPEG multipart 帧"""
+    return (
+        MJPEG_BOUNDARY + "\r\n"
+        "Content-Type: image/jpeg\r\n"
+        "Content-Length: %d\r\n"
+        "\r\n" % len(jpeg_data)
+    ).encode() + jpeg_data + b"\r\n"
+
+
+# ===== WiFi AP =====
 
 def setup_wifi_ap():
     ap = network.WLAN(network.AP_IF)
     ap.config(ssid=AP_SSID, key=AP_PASSWORD)
     ip = ap.ifconfig()[0]
-    print("WiFi AP 已建立")
-    print("  SSID : %s" % AP_SSID)
-    print("  密码 : %s" % AP_PASSWORD)
-    print("  IP   : %s" % ip)
-    return ip
+    print("WiFi AP: %s  密码: %s  IP: %s" % (AP_SSID, AP_PASSWORD, ip))
+    return ip, ap
 
 
 # ===== 主程序 =====
@@ -133,51 +93,105 @@ def main():
     os.exitpoint(os.EXITPOINT_ENABLE)
 
     print("=" * 40)
-    print("K230D 实时图传启动")
+    print("K230D MJPEG 实时图传启动")
     print("=" * 40)
 
     # 1. WiFi AP
-    ip = setup_wifi_ap()
+    ip, ap = setup_wifi_ap()
 
-    # 2. 初始化显示（状态提示）
+    # 2. 摄像头
+    sensor = Sensor()
+    sensor.reset()
+    sensor.set_framesize(width=WIDTH, height=HEIGHT)
+    sensor.set_pixformat(Sensor.RGB565)
     Display.init(Display.ST7701, width=800, height=480, to_ide=True)
-
-    # 3. RTSP 推流
     MediaManager.init()
-    rtspserver = RtspServer(SESSION, PORT)
-    rtspserver.start()
-    url = rtspserver.get_url()
-    print("RTSP 推流地址: %s" % url)
-    print("VLC/ffplay: rtsp://%s:%d/%s" % (ip, PORT, SESSION))
+    sensor.run()
+    time.sleep(0.5)
+
+    # 3. HTTP Socket
+    s = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
+    s.setsockopt(usocket.SOL_SOCKET, usocket.SO_REUSEADDR, 1)
+    s.bind((ip, PORT))
+    s.listen(2)
+    s.setblocking(False)
+    print("HTTP 服务: http://%s" % ip)
+    print("VLC: http://%s/stream" % ip)
     print("=" * 40)
 
-    # 4. 状态显示循环
+    stream_client = None
+    stream_frame = 0
+    last_jpeg = None
     clock = time.clock()
+
     try:
         while True:
             os.exitpoint()
             clock.tick()
 
-            # 在 LCD 上显示连接信息
-            img = image.Image(800, 480, image.RGB565)
-            img.draw_rectangle(0, 0, 800, 480, color=(0, 0, 0), fill=True)
-            img.draw_string_advanced(20, 20, 24,
-                                     "K230D RTSP Stream",
-                                     color=(0, 255, 0))
-            img.draw_string_advanced(20, 60, 18,
-                                     "SSID: %s" % AP_SSID,
-                                     color=(255, 255, 255))
-            img.draw_string_advanced(20, 85, 18,
-                                     "IP: %s:%d" % (ip, PORT),
-                                     color=(255, 255, 255))
-            img.draw_string_advanced(20, 110, 18,
-                                     "URL: rtsp://%s:%d/%s" % (ip, PORT, SESSION),
-                                     color=(200, 200, 200))
-            img.draw_string_advanced(20, 150, 14,
-                                     "%.1f fps  %dx%d" % (clock.fps(), WIDTH, HEIGHT),
-                                     color=(128, 128, 128))
+            # ---- 抓帧 ----
+            img = sensor.snapshot()
+            last_jpeg = bytes(img.compress(quality=JPEG_QUALITY))
             Display.show_image(img)
-            del img
+
+            # ---- MJPEG 推帧 ----
+            if stream_client is not None:
+                part = build_mjpeg_frame(last_jpeg)
+                if send_all(stream_client, part):
+                    stream_frame += 1
+                else:
+                    try:
+                        stream_client.close()
+                    except:
+                        pass
+                    stream_client = None
+                    print("客户端断开（共推 %d 帧）" % stream_frame)
+                    stream_frame = 0
+
+            # ---- 接受新连接 ----
+            try:
+                cl, caddr = s.accept()
+            except OSError:
+                gc.collect()
+                continue
+
+            # ---- 读 HTTP 请求 ----
+            try:
+                cl.settimeout(0.3)
+                req = cl.recv(512).decode()
+            except Exception:
+                try:
+                    cl.close()
+                except:
+                    pass
+                continue
+
+            # ---- 路由 ----
+            try:
+                if "/stream" in req:
+                    if stream_client is not None:
+                        try:
+                            stream_client.close()
+                        except:
+                            pass
+                    stream_client = cl
+                    stream_frame = 0
+                    print("MJPEG 客户端: %s" % str(caddr))
+                    send_all(cl, MJPEG_HEADER)
+                else:
+                    print("HTTP 页面: %s" % str(caddr))
+                    send_all(cl, HTML_HEADER + HTML_PAGE)
+                    time.sleep_ms(50)
+                    try:
+                        cl.close()
+                    except:
+                        pass
+            except Exception as e:
+                try:
+                    cl.close()
+                except:
+                    pass
+
             gc.collect()
 
     except KeyboardInterrupt:
@@ -186,9 +200,17 @@ def main():
         import sys
         sys.print_exception(e)
     finally:
-        rtspserver.stop()
+        if stream_client is not None:
+            try:
+                stream_client.close()
+            except:
+                pass
+        sensor.stop()
+        time.sleep_ms(200)
+        s.close()
         Display.deinit()
         MediaManager.deinit()
+        gc.collect()
         print("资源已释放")
 
 
