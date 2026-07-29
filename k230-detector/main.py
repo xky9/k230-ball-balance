@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 # 钢球位置检测 — 立创庐山派 K230
-# 方案：OTSU自适应二值化（ROI内自动分离钢球与背景）
-#       绿色矩形=凹槽ROI → OTSU二值化 → 最大色块=钢球 → UART
+# 方案：HSV绿色掩码 + OTSU（排除绿色凹槽，只留非绿色钢球反光）
 # 输出：UART 偏移百分比 给主控
 
 import os, gc, time, sys
@@ -17,28 +16,30 @@ from ulab import numpy as np
 CAMERA_WIDTH  = 320
 CAMERA_HEIGHT = 240
 
-# 凹槽ROI矩形
 ROI_X = 10
-ROI_Y = 110             # 画面中间
+ROI_Y = 110
 ROI_W = 300
-ROI_H = 20              # 中间20行
+ROI_H = 20
 
-# OTSU模式：False=球亮背景暗(THRESH_BINARY), True=球暗背景亮(THRESH_BINARY_INV)
-INVERT = False
+# 绿色HSV阈值（用阈值测试.py标定后填入）
+# 格式：np.array([H, S, V], dtype=np.uint8), H:0-180 S:0-255 V:0-255
+COLOR_LO1 = np.array([40, 113, 107], dtype=np.uint8)
+COLOR_HI1 = np.array([60, 225, 214], dtype=np.uint8)
+# 双区间（绿色一般不跨边界，保留备用）
+USE_DUAL = False
+COLOR_LO2 = np.array([0, 0, 0], dtype=np.uint8)
+COLOR_HI2 = np.array([0, 0, 0], dtype=np.uint8)
 
-# 面积过滤
-MIN_AREA = 5            # 最小面积（过滤噪点）
-MAX_AREA = 30           # 最大面积（过滤凹槽外壁）
+THRESH_ALPHA = 0.05
 
-# 形状过滤（排除条状反光，保留近圆形钢球）
-MIN_ASPECT = 0.4        # 最小宽高比（w/h），条状<0.4被排除
-MAX_ASPECT = 2.5        # 最大宽高比（w/h），条状>2.5被排除
+MIN_AREA = 1
+MAX_AREA = 100
+MIN_ASPECT = 0.3
+MAX_ASPECT = 3
 
-# 凹槽中心X
 GROOVE_CENTER_X = ROI_X + ROI_W // 2
 HALF_WIDTH      = ROI_W // 2
 
-# UART
 UART_BAUD   = 115200
 UART_TX_PIN = 5
 UART_RX_PIN = 6
@@ -47,86 +48,115 @@ UART_RX_PIN = 6
 ROI_END_X = ROI_X + ROI_W
 ROI_END_Y = ROI_Y + ROI_H
 
-if INVERT:
-    OTSU_MODE = cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-else:
-    OTSU_MODE = cv2.THRESH_BINARY + cv2.THRESH_OTSU
-
 sensor = None
 uart = None
+smooth_th = -1.0
+buf_hsv   = None
+buf_gray  = None
+buf_green = None
+buf_ngreen = None
+buf_masked = None
+
+
+def alloc_buf():
+    global buf_hsv, buf_gray, buf_green, buf_ngreen, buf_masked
+    buf_hsv    = np.zeros((ROI_H, ROI_W, 3), dtype=np.uint8)
+    buf_gray   = np.zeros((ROI_H, ROI_W),    dtype=np.uint8)
+    buf_green  = np.zeros((ROI_H, ROI_W),    dtype=np.uint8)
+    buf_ngreen = np.zeros((ROI_H, ROI_W),    dtype=np.uint8)
+    buf_masked = np.zeros((ROI_H, ROI_W),    dtype=np.uint8)
 
 
 def find_ball(img_np):
-    """ROI内OTSU二值化+找钢球色块，返回(cx,cy,rx,ry,rw,rh,area)或None"""
+    global smooth_th
+
     roi = img_np[ROI_Y:ROI_END_Y, ROI_X:ROI_END_X]
-    _, binary = cv2.threshold(roi, 0, 255, OTSU_MODE)
+
+    # 1. 绿色掩码（HSV空间，双区间支持）
+    cv2.cvtColor(roi, cv2.COLOR_BGR2HSV, dst=buf_hsv)
+    cv2.inRange(buf_hsv, COLOR_LO1, COLOR_HI1, dst=buf_green)
+    if USE_DUAL:
+        cv2.inRange(buf_hsv, COLOR_LO2, COLOR_HI2, dst=buf_ngreen)
+        cv2.bitwise_or(buf_green, buf_ngreen, dst=buf_green)
+    cv2.bitwise_not(buf_green, dst=buf_ngreen)
+
+    # 2. 灰度 + 掩掉绿色区域（灰度 AND 反绿掩码）
+    cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY, dst=buf_gray)
+    cv2.bitwise_and(buf_gray, buf_ngreen, dst=buf_masked)
+
+    # 3. OTSU + EMA平滑
+    retval, _ = cv2.threshold(buf_masked, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if smooth_th < 0:
+        smooth_th = float(retval)
+    else:
+        smooth_th = THRESH_ALPHA * float(retval) + (1.0 - THRESH_ALPHA) * smooth_th
+
+    th = int(smooth_th)
+    _, binary = cv2.threshold(buf_masked, th, 255, cv2.THRESH_BINARY)
 
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
                                     cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None
+        return None, (0, 0, 0, 0), th, binary
 
-    # 筛选：面积在范围内 + 不贴ROI边缘（排除外壁）
     best_cnt, best_area = None, 0
     best_x = best_y = best_w = best_h = 0
+    n_area = n_edge = n_shape = 0
 
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         a = cv2.contourArea(cnt)
 
-        # 面积过滤
         if a < MIN_AREA or a > MAX_AREA:
             continue
-
-        # 贴边过滤（外壁一定挨着ROI上下边缘）
-        if y <= 1 or y + h >= ROI_H - 1:
+        n_area += 1
+        if (y <= 1 or y + h >= ROI_H - 1) and w > 20:
             continue
-
-        # 形状过滤（条状反光 vs 紧凑钢球）
-        if h > 0:
+        n_edge += 1
+        if a > 12 and h > 0:
             aspect = float(w) / float(h)
             if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
                 continue
+        n_shape += 1
 
         if a > best_area:
             best_area = a
             best_cnt = cnt
             best_x, best_y, best_w, best_h = x, y, w, h
 
+    stats = (len(contours), n_area, n_edge, n_shape)
     if best_cnt is None:
-        return None
+        return None, stats, th, binary
 
     cx = ROI_X + best_x + best_w // 2
     cy = ROI_Y + best_y + best_h // 2
     rx = ROI_X + best_x
     ry = ROI_Y + best_y
-    return cx, cy, rx, ry, best_w, best_h, best_area
+    return (cx, cy, rx, ry, best_w, best_h, best_area), stats, th, binary
 
 
 try:
-    # --- 摄像头 ---
     sensor = Sensor(width=1280, height=960, fps=90)
     sensor.reset()
     sensor.set_framesize(width=CAMERA_WIDTH, height=CAMERA_HEIGHT)
-    sensor.set_pixformat(Sensor.GRAYSCALE)
+    sensor.set_pixformat(Sensor.RGB888)
 
-    # --- LCD ---
     Display.init(Display.ST7701, width=800, height=480, to_ide=True)
 
-    # --- UART ---
     fpioa = FPIOA()
     fpioa.set_function(UART_TX_PIN, fpioa.UART2_TXD)
     fpioa.set_function(UART_RX_PIN, fpioa.UART2_RXD)
     uart = UART(UART.UART2, baudrate=UART_BAUD, bits=UART.EIGHTBITS,
                 parity=UART.PARITY_NONE, stop=UART.STOPBITS_ONE)
 
-    # --- 启动 ---
     MediaManager.init()
     sensor.run()
     time.sleep(0.5)
+    alloc_buf()
     clock = time.clock()
 
-    print("钢球检测器启动完成（OTSU模式）")
+    print("OTSU+GreenMask启动")
+    fc = 0
 
     while True:
         os.exitpoint()
@@ -135,8 +165,8 @@ try:
         img = sensor.snapshot()
         img_np = img.to_numpy_ref()
 
-        # === 检测 ===
-        result = find_ball(img_np)
+        result, stats, th, binary_np = find_ball(img_np)
+        raw_n, n_area, n_edge, n_shape = stats
 
         if result is not None:
             ball_x, ball_y, rx, ry, rw, rh, area = result
@@ -147,45 +177,42 @@ try:
                                color=(255, 255, 255), thickness=2)
             img.draw_cross(ball_x, ball_y, color=(255, 255, 255),
                            size=8, thickness=2)
-            status = "%+.1f%% A:%d" % (offset_pct, area)
-            sc = (0, 255, 0)
         else:
-            status = "NO BALL"
-            sc = (255, 0, 0)
+            offset_pct = 0.0
 
-        # === 显示 ===
-        # 上屏：原图 + ROI + 检测
         img.draw_rectangle(ROI_X, ROI_Y, ROI_W, ROI_H,
                            color=(0, 255, 0), thickness=2)
         img.draw_line(GROOVE_CENTER_X, ROI_Y, GROOVE_CENTER_X, ROI_END_Y,
                       color=(128, 128, 128), thickness=1)
-        img.draw_string_advanced(2, 2, 14,
-                                 "FPS:%.1f %s" % (clock.fps(), status),
-                                 color=sc)
+
+        pipe = "R%d>A%d>E%d>S%d" % (raw_n, n_area, n_edge, n_shape)
+        img.draw_string_advanced(2, 2, 14, "%.1f %+.1f%%" % (clock.fps(), offset_pct),
+                                 color=(255, 255, 255))
+        img.draw_string_advanced(2, 18, 14, pipe, color=(255, 255, 255))
 
         top_rgb565 = img.to_rgb565()
 
-        # 下屏：OTSU二值图（原始尺寸）
-        roi = img_np[ROI_Y:ROI_END_Y, ROI_X:ROI_END_X]
-        _, binary_np = cv2.threshold(roi, 0, 255, OTSU_MODE)
+        # 下屏：掩码后二值图
         binary_img = image.Image(ROI_W, ROI_H, image.GRAYSCALE,
                                  alloc=image.ALLOC_REF, data=binary_np)
-
         bar_canvas = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT, image.RGB565)
+        bar_canvas.draw_rectangle(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT,
+                                  color=(0, 0, 0), fill=True)
         bar_canvas.draw_image(binary_img.to_rgb565(), ROI_X, ROI_Y)
-        bar_canvas.draw_string_advanced(2, 4, 14,
-                                        "OTSU %s" %
-                                        ("INV" if INVERT else "BIN"),
-                                        color=(255, 255, 0))
+        line = "T:%d R%d>A%d>E%d>S%d" % (th, raw_n, n_area, n_edge, n_shape)
+        bar_canvas.draw_string_advanced(2, 4, 14, line, color=(255, 255, 0))
 
-        # 拼接
         canvas = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT * 2, image.RGB565)
         canvas.draw_image(top_rgb565, 0, 0)
         canvas.draw_image(bar_canvas, 0, CAMERA_HEIGHT)
-
         Display.show_image(canvas)
 
-        del img_np, roi, binary_np, binary_img, top_rgb565, bar_canvas, canvas
+        fc += 1
+        if fc % 20 == 0:
+            print("%.1ffps %+.1f%% T:%d R%d>A%d>E%d>S%d" %
+                  (clock.fps(), offset_pct, th,
+                   raw_n, n_area, n_edge, n_shape))
+
         gc.collect()
 
 except KeyboardInterrupt:
