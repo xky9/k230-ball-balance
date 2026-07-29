@@ -21,8 +21,8 @@ ROI_Y = 115
 ROI_W = 300
 
 # 校准 / 识别 ROI 高度
-CALIB_ROI_H  = 15
-DETECT_ROI_H = 20
+CALIB_ROI_H  = 12
+DETECT_ROI_H = 15
 
 # HSV 余量
 H_MARGIN = 8
@@ -31,7 +31,7 @@ V_MARGIN = 30
 
 THRESH_ALPHA = 0.05
 
-MIN_AREA = 1
+MIN_AREA = 3
 MAX_AREA = 100
 MIN_ASPECT = 0.3
 MAX_ASPECT = 3
@@ -75,6 +75,22 @@ def set_roi(h):
     global ROI_H, ROI_END_Y
     ROI_H = h
     ROI_END_Y = ROI_Y + h
+
+
+def show_frame(img, bot_label=None, bot_img=None, bot_color=(255, 255, 0)):
+    """显示上下分屏画布"""
+    top = img.to_rgb565()
+    bot = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT, image.RGB565)
+    bot.draw_rectangle(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT,
+                       color=(0, 0, 0), fill=True)
+    if bot_img is not None:
+        bot.draw_image(bot_img.to_rgb565(), ROI_X, ROI_Y)
+    if bot_label is not None:
+        bot.draw_string_advanced(2, 4, 14, bot_label, color=bot_color)
+    canvas = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT * 2, image.RGB565)
+    canvas.draw_image(top, 0, 0)
+    canvas.draw_image(bot, 0, CAMERA_HEIGHT)
+    Display.show_image(canvas)
 
 
 def calibrate_hsv(img_np):
@@ -152,7 +168,10 @@ def find_ball(img_np):
         if a < MIN_AREA or a > MAX_AREA:
             continue
         n_area += 1
-        if y <= 1 or y + h >= ROI_H - 1:
+        # 贴边=贯穿ROI的条状物（槽壁），球贴边不会同时贴对边
+        edge_tb = (y <= 0 and y + h >= ROI_H - 1)
+        edge_lr = (x <= 0 and x + w >= ROI_W - 1)
+        if edge_tb or edge_lr:
             continue
         n_edge += 1
         if a > 12 and h > 0:
@@ -234,15 +253,7 @@ try:
                     img2.draw_string_advanced(
                         CAMERA_WIDTH // 2 - 20, CAMERA_HEIGHT // 2 - 10,
                         32, "%d" % n, color=(255, 255, 0))
-                    # 用画布显示（与识别模式一致，避免切换冲突）
-                    c_top = img2.to_rgb565()
-                    c_bot = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT, image.RGB565)
-                    c_bot.draw_rectangle(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT,
-                                         color=(0, 0, 0), fill=True)
-                    c_canvas = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT * 2, image.RGB565)
-                    c_canvas.draw_image(c_top, 0, 0)
-                    c_canvas.draw_image(c_bot, 0, CAMERA_HEIGHT)
-                    Display.show_image(c_canvas)
+                    show_frame(img2)
                     time.sleep(1)
 
                 # 采样标定
@@ -250,34 +261,18 @@ try:
                 img3_np = img3.to_numpy_ref()
                 calibrate_hsv(img3_np)
 
-                # 显示完成提示
                 img3.draw_rectangle(ROI_X, ROI_Y, ROI_W, CALIB_ROI_H,
                                     color=(0, 255, 0), thickness=2)
                 img3.draw_string_advanced(CAMERA_WIDTH // 2 - 40,
                                           CAMERA_HEIGHT // 2 - 10,
                                           32, "Calib OK", color=(0, 255, 0))
-                top3 = img3.to_rgb565()
-                bot3 = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT, image.RGB565)
-                bot3.draw_rectangle(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT,
-                                    color=(0, 0, 0), fill=True)
-                c3 = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT * 2, image.RGB565)
-                c3.draw_image(top3, 0, 0)
-                c3.draw_image(bot3, 0, CAMERA_HEIGHT)
-                Display.show_image(c3)
+                show_frame(img3)
                 time.sleep(1)
                 calib_done = True
         elif usr_key.value() == 0:
             key_prev = False
 
-        # 用画布显示（与识别模式一致）
-        top = img.to_rgb565()
-        bot = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT, image.RGB565)
-        bot.draw_rectangle(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT,
-                           color=(0, 0, 0), fill=True)
-        canvas = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT * 2, image.RGB565)
-        canvas.draw_image(top, 0, 0)
-        canvas.draw_image(bot, 0, CAMERA_HEIGHT)
-        Display.show_image(canvas)
+        show_frame(img)
         gc.collect()
 
     # ===== 识别模式 =====
@@ -299,7 +294,7 @@ try:
         if result is not None:
             ball_x, ball_y, rx, ry, rw, rh, area = result
             offset_pct = (ball_x - GROOVE_CENTER_X) / HALF_WIDTH * 100.0
-            uart.write("%.1f\n" % offset_pct)
+            uart.write("[%.1f]" % offset_pct)
 
             img.draw_rectangle(rx, ry, rw, rh,
                                color=(255, 255, 255), thickness=2)
@@ -318,21 +313,10 @@ try:
                                  color=(255, 255, 255))
         img.draw_string_advanced(2, 18, 14, pipe, color=(255, 255, 255))
 
-        top_rgb565 = img.to_rgb565()
-
         binary_img = image.Image(ROI_W, DETECT_ROI_H, image.GRAYSCALE,
                                  alloc=image.ALLOC_REF, data=binary_np)
-        bar_canvas = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT, image.RGB565)
-        bar_canvas.draw_rectangle(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT,
-                                  color=(0, 0, 0), fill=True)
-        bar_canvas.draw_image(binary_img.to_rgb565(), ROI_X, ROI_Y)
-        line = "T:%d R%d>A%d>E%d>S%d" % (th, raw_n, n_area, n_edge, n_shape)
-        bar_canvas.draw_string_advanced(2, 4, 14, line, color=(255, 255, 0))
-
-        canvas = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT * 2, image.RGB565)
-        canvas.draw_image(top_rgb565, 0, 0)
-        canvas.draw_image(bar_canvas, 0, CAMERA_HEIGHT)
-        Display.show_image(canvas)
+        label = "T:%d R%d>A%d>E%d>S%d" % (th, raw_n, n_area, n_edge, n_shape)
+        show_frame(img, label, binary_img)
 
         fc += 1
         if fc % 20 == 0:
