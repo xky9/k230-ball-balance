@@ -1,0 +1,9 @@
+# Markdown 文档
+*.md
+
+# Claude 配置
+.claude/
+
+# Python
+__pycache__/
+*.pyc
