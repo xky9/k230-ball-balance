@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # 钢球位置检测 — 立创庐山派 K230
-# 方案：HSV绿色掩码 + OTSU（排除绿色凹槽，只留非绿色钢球反光）
+# 方案：上电标定绿色HSV → OTSU + 绿色掩码 → UART
 # 输出：UART 偏移百分比 给主控
 
 import os, gc, time, sys
@@ -9,7 +9,7 @@ import image
 from media.sensor import *
 from media.display import *
 from media.media import *
-from machine import UART, FPIOA
+from machine import UART, FPIOA, Pin
 from ulab import numpy as np
 
 # ===== 可调参数 =====
@@ -17,18 +17,17 @@ CAMERA_WIDTH  = 320
 CAMERA_HEIGHT = 240
 
 ROI_X = 10
-ROI_Y = 110
+ROI_Y = 115
 ROI_W = 300
-ROI_H = 20
 
-# 绿色HSV阈值（用阈值测试.py标定后填入）
-# 格式：np.array([H, S, V], dtype=np.uint8), H:0-180 S:0-255 V:0-255
-COLOR_LO1 = np.array([40, 113, 107], dtype=np.uint8)
-COLOR_HI1 = np.array([60, 225, 214], dtype=np.uint8)
-# 双区间（绿色一般不跨边界，保留备用）
-USE_DUAL = False
-COLOR_LO2 = np.array([0, 0, 0], dtype=np.uint8)
-COLOR_HI2 = np.array([0, 0, 0], dtype=np.uint8)
+# 校准 / 识别 ROI 高度
+CALIB_ROI_H  = 15
+DETECT_ROI_H = 20
+
+# HSV 余量
+H_MARGIN = 8
+S_MARGIN = 20
+V_MARGIN = 30
 
 THRESH_ALPHA = 0.05
 
@@ -43,28 +42,76 @@ HALF_WIDTH      = ROI_W // 2
 UART_BAUD   = 115200
 UART_TX_PIN = 5
 UART_RX_PIN = 6
+USR_KEY_NUM = 53
 # ======================
 
-ROI_END_X = ROI_X + ROI_W
-ROI_END_Y = ROI_Y + ROI_H
+# 可变阈值（校准阶段更新）
+color_lo1 = np.array([40, 113, 107], dtype=np.uint8)
+color_hi1 = np.array([60, 225, 214], dtype=np.uint8)
 
 sensor = None
 uart = None
+usr_key = None
 smooth_th = -1.0
-buf_hsv   = None
-buf_gray  = None
-buf_green = None
-buf_ngreen = None
-buf_masked = None
+ROI_H = CALIB_ROI_H  # 当前ROI高度
+ROI_END_X = ROI_X + ROI_W
+ROI_END_Y = ROI_Y + ROI_H
+
+buf_hsv = buf_gray = buf_green = buf_ngreen = buf_masked = None
 
 
 def alloc_buf():
     global buf_hsv, buf_gray, buf_green, buf_ngreen, buf_masked
-    buf_hsv    = np.zeros((ROI_H, ROI_W, 3), dtype=np.uint8)
-    buf_gray   = np.zeros((ROI_H, ROI_W),    dtype=np.uint8)
-    buf_green  = np.zeros((ROI_H, ROI_W),    dtype=np.uint8)
-    buf_ngreen = np.zeros((ROI_H, ROI_W),    dtype=np.uint8)
-    buf_masked = np.zeros((ROI_H, ROI_W),    dtype=np.uint8)
+    # 按最大的 ROI_H 分配
+    h = DETECT_ROI_H
+    buf_hsv    = np.zeros((h, ROI_W, 3), dtype=np.uint8)
+    buf_gray   = np.zeros((h, ROI_W),    dtype=np.uint8)
+    buf_green  = np.zeros((h, ROI_W),    dtype=np.uint8)
+    buf_ngreen = np.zeros((h, ROI_W),    dtype=np.uint8)
+    buf_masked = np.zeros((h, ROI_W),    dtype=np.uint8)
+
+
+def set_roi(h):
+    global ROI_H, ROI_END_Y
+    ROI_H = h
+    ROI_END_Y = ROI_Y + h
+
+
+def calibrate_hsv(img_np):
+    """在校准ROI内统计HSV min/max，更新 color_lo1/color_hi1"""
+    global color_lo1, color_hi1
+    set_roi(CALIB_ROI_H)
+    roi = img_np[ROI_Y:ROI_END_Y, ROI_X:ROI_END_X]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    h_min = s_min = v_min = 255
+    h_max = s_max = v_max = 0
+
+    for row in range(ROI_H):
+        for col in range(ROI_W):
+            px = hsv[row, col]
+            h, s, v = int(px[0]), int(px[1]), int(px[2])
+            if h < h_min: h_min = h
+            if h > h_max: h_max = h
+            if s < s_min: s_min = s
+            if s > s_max: s_max = s
+            if v < v_min: v_min = v
+            if v > v_max: v_max = v
+
+    lo_h = max(h_min - H_MARGIN, 0)
+    lo_s = max(s_min - S_MARGIN, 0)
+    lo_v = max(v_min - V_MARGIN, 0)
+    hi_h = min(h_max + H_MARGIN, 180)
+    hi_s = min(s_max + S_MARGIN, 255)
+    hi_v = min(v_max + V_MARGIN, 255)
+
+    color_lo1 = np.array([lo_h, lo_s, lo_v], dtype=np.uint8)
+    color_hi1 = np.array([hi_h, hi_s, hi_v], dtype=np.uint8)
+
+    print("标定完成 H[%d-%d] S[%d-%d] V[%d-%d]" %
+          (h_min, h_max, s_min, s_max, v_min, v_max))
+    print("COLOR_LO1 = [%d, %d, %d]" % (lo_h, lo_s, lo_v))
+    print("COLOR_HI1 = [%d, %d, %d]" % (hi_h, hi_s, hi_v))
 
 
 def find_ball(img_np):
@@ -72,20 +119,15 @@ def find_ball(img_np):
 
     roi = img_np[ROI_Y:ROI_END_Y, ROI_X:ROI_END_X]
 
-    # 1. 绿色掩码（HSV空间，双区间支持）
     cv2.cvtColor(roi, cv2.COLOR_BGR2HSV, dst=buf_hsv)
-    cv2.inRange(buf_hsv, COLOR_LO1, COLOR_HI1, dst=buf_green)
-    if USE_DUAL:
-        cv2.inRange(buf_hsv, COLOR_LO2, COLOR_HI2, dst=buf_ngreen)
-        cv2.bitwise_or(buf_green, buf_ngreen, dst=buf_green)
+    cv2.inRange(buf_hsv, color_lo1, color_hi1, dst=buf_green)
     cv2.bitwise_not(buf_green, dst=buf_ngreen)
 
-    # 2. 灰度 + 掩掉绿色区域（灰度 AND 反绿掩码）
     cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY, dst=buf_gray)
     cv2.bitwise_and(buf_gray, buf_ngreen, dst=buf_masked)
 
-    # 3. OTSU + EMA平滑
-    retval, _ = cv2.threshold(buf_masked, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    retval, _ = cv2.threshold(buf_masked, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if smooth_th < 0:
         smooth_th = float(retval)
     else:
@@ -110,7 +152,7 @@ def find_ball(img_np):
         if a < MIN_AREA or a > MAX_AREA:
             continue
         n_area += 1
-        if (y <= 1 or y + h >= ROI_H - 1) and w > 20:
+        if y <= 1 or y + h >= ROI_H - 1:
             continue
         n_edge += 1
         if a > 12 and h > 0:
@@ -149,13 +191,99 @@ try:
     uart = UART(UART.UART2, baudrate=UART_BAUD, bits=UART.EIGHTBITS,
                 parity=UART.PARITY_NONE, stop=UART.STOPBITS_ONE)
 
+    fpioa.set_function(USR_KEY_NUM, FPIOA.GPIO0 + USR_KEY_NUM)
+    usr_key = Pin(USR_KEY_NUM, Pin.IN, Pin.PULL_DOWN)
+
     MediaManager.init()
     sensor.run()
     time.sleep(0.5)
     alloc_buf()
     clock = time.clock()
 
-    print("OTSU+GreenMask启动")
+    # ===== 校准模式 =====
+    set_roi(CALIB_ROI_H)
+    print("校准模式 — 将凹槽对准绿框，按USR键")
+    key_prev = False
+    calib_done = False
+
+    while not calib_done:
+        os.exitpoint()
+        clock.tick()
+
+        img = sensor.snapshot()
+        img_np = img.to_numpy_ref()
+
+        # 画校准框
+        img.draw_rectangle(ROI_X, ROI_Y, ROI_W, CALIB_ROI_H,
+                           color=(0, 255, 0), thickness=2)
+        img.draw_line(GROOVE_CENTER_X, ROI_Y, GROOVE_CENTER_X,
+                      ROI_Y + CALIB_ROI_H, color=(128, 128, 128), thickness=1)
+        img.draw_string_advanced(2, 2, 14, "Press USR to calib",
+                                 color=(255, 255, 0))
+
+        # USR按键检测
+        if usr_key.value() == 1 and not key_prev:
+            key_prev = True
+            time.sleep_ms(10)
+            if usr_key.value() == 1:
+                # 倒数3秒
+                for n in range(3, 0, -1):
+                    img2 = sensor.snapshot()
+                    img2.draw_rectangle(ROI_X, ROI_Y, ROI_W, CALIB_ROI_H,
+                                        color=(0, 255, 0), thickness=2)
+                    img2.draw_string_advanced(
+                        CAMERA_WIDTH // 2 - 20, CAMERA_HEIGHT // 2 - 10,
+                        32, "%d" % n, color=(255, 255, 0))
+                    # 用画布显示（与识别模式一致，避免切换冲突）
+                    c_top = img2.to_rgb565()
+                    c_bot = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT, image.RGB565)
+                    c_bot.draw_rectangle(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT,
+                                         color=(0, 0, 0), fill=True)
+                    c_canvas = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT * 2, image.RGB565)
+                    c_canvas.draw_image(c_top, 0, 0)
+                    c_canvas.draw_image(c_bot, 0, CAMERA_HEIGHT)
+                    Display.show_image(c_canvas)
+                    time.sleep(1)
+
+                # 采样标定
+                img3 = sensor.snapshot()
+                img3_np = img3.to_numpy_ref()
+                calibrate_hsv(img3_np)
+
+                # 显示完成提示
+                img3.draw_rectangle(ROI_X, ROI_Y, ROI_W, CALIB_ROI_H,
+                                    color=(0, 255, 0), thickness=2)
+                img3.draw_string_advanced(CAMERA_WIDTH // 2 - 40,
+                                          CAMERA_HEIGHT // 2 - 10,
+                                          32, "Calib OK", color=(0, 255, 0))
+                top3 = img3.to_rgb565()
+                bot3 = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT, image.RGB565)
+                bot3.draw_rectangle(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT,
+                                    color=(0, 0, 0), fill=True)
+                c3 = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT * 2, image.RGB565)
+                c3.draw_image(top3, 0, 0)
+                c3.draw_image(bot3, 0, CAMERA_HEIGHT)
+                Display.show_image(c3)
+                time.sleep(1)
+                calib_done = True
+        elif usr_key.value() == 0:
+            key_prev = False
+
+        # 用画布显示（与识别模式一致）
+        top = img.to_rgb565()
+        bot = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT, image.RGB565)
+        bot.draw_rectangle(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT,
+                           color=(0, 0, 0), fill=True)
+        canvas = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT * 2, image.RGB565)
+        canvas.draw_image(top, 0, 0)
+        canvas.draw_image(bot, 0, CAMERA_HEIGHT)
+        Display.show_image(canvas)
+        gc.collect()
+
+    # ===== 识别模式 =====
+    set_roi(DETECT_ROI_H)
+    smooth_th = -1.0  # 重置平滑阈值
+    print("识别模式启动")
     fc = 0
 
     while True:
@@ -180,7 +308,7 @@ try:
         else:
             offset_pct = 0.0
 
-        img.draw_rectangle(ROI_X, ROI_Y, ROI_W, ROI_H,
+        img.draw_rectangle(ROI_X, ROI_Y, ROI_W, DETECT_ROI_H,
                            color=(0, 255, 0), thickness=2)
         img.draw_line(GROOVE_CENTER_X, ROI_Y, GROOVE_CENTER_X, ROI_END_Y,
                       color=(128, 128, 128), thickness=1)
@@ -192,8 +320,7 @@ try:
 
         top_rgb565 = img.to_rgb565()
 
-        # 下屏：掩码后二值图
-        binary_img = image.Image(ROI_W, ROI_H, image.GRAYSCALE,
+        binary_img = image.Image(ROI_W, DETECT_ROI_H, image.GRAYSCALE,
                                  alloc=image.ALLOC_REF, data=binary_np)
         bar_canvas = image.Image(CAMERA_WIDTH, CAMERA_HEIGHT, image.RGB565)
         bar_canvas.draw_rectangle(0, 0, CAMERA_WIDTH, CAMERA_HEIGHT,
