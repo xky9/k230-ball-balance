@@ -40,8 +40,8 @@ GROOVE_CENTER_X = ROI_X + ROI_W // 2
 HALF_WIDTH      = ROI_W // 2
 
 UART_BAUD   = 115200
-UART_TX_PIN = 5
-UART_RX_PIN = 6
+UART_TX_PIN = 11
+UART_RX_PIN = 12
 USR_KEY_NUM = 53
 # ======================
 
