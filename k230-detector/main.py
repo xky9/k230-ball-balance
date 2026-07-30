@@ -17,7 +17,7 @@ CAMERA_WIDTH  = 320
 CAMERA_HEIGHT = 240
 
 ROI_X = 10
-ROI_Y = 115
+ROI_Y = 145
 ROI_W = 300
 
 # 校准 / 识别 ROI 高度
@@ -31,13 +31,21 @@ V_MARGIN = 30
 
 THRESH_ALPHA = 0.05
 
-MIN_AREA = 3
-MAX_AREA = 100
-MIN_ASPECT = 0.3
-MAX_ASPECT = 3
+MIN_AREA = 10
+MAX_AREA = 250
+MIN_ASPECT = 0.6
+MAX_ASPECT = 1.7
 
 GROOVE_CENTER_X = ROI_X + ROI_W // 2
 HALF_WIDTH      = ROI_W // 2
+
+# 跳变过滤
+MAX_JUMP     = 20   # 相邻帧允许的最大X位移（像素）
+LOST_TIMEOUT = 20   # 连续丢失/跳变超过此帧数则重新搜索全ROI
+
+# 形态学
+MORPH_KSIZE = 5    # 横向矩形核宽度
+MORPH_ITERS = 1    # 开运算迭代次数
 
 UART_BAUD   = 115200
 UART_TX_PIN = 11
@@ -54,21 +62,29 @@ uart = None
 usr_key = None
 smooth_th = -1.0
 ROI_H = CALIB_ROI_H  # 当前ROI高度
+# 跳变过滤跟踪状态
+last_valid_ball = None   # (cx, cy, offset_pct) 或 None
+lost_count = 0
 ROI_END_X = ROI_X + ROI_W
 ROI_END_Y = ROI_Y + ROI_H
 
 buf_hsv = buf_gray = buf_green = buf_ngreen = buf_masked = None
+buf_th = buf_open = morph_kernel = None
 
 
 def alloc_buf():
     global buf_hsv, buf_gray, buf_green, buf_ngreen, buf_masked
-    # 按最大的 ROI_H 分配
+    global buf_th, buf_open, morph_kernel
     h = DETECT_ROI_H
     buf_hsv    = np.zeros((h, ROI_W, 3), dtype=np.uint8)
     buf_gray   = np.zeros((h, ROI_W),    dtype=np.uint8)
     buf_green  = np.zeros((h, ROI_W),    dtype=np.uint8)
     buf_ngreen = np.zeros((h, ROI_W),    dtype=np.uint8)
     buf_masked = np.zeros((h, ROI_W),    dtype=np.uint8)
+    buf_th     = np.zeros((h, ROI_W),    dtype=np.uint8)
+    buf_open   = np.zeros((h, ROI_W),    dtype=np.uint8)
+    morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT,
+                                              (1, MORPH_KSIZE))  # 横向核
 
 
 def set_roi(h):
@@ -150,12 +166,16 @@ def find_ball(img_np):
         smooth_th = THRESH_ALPHA * float(retval) + (1.0 - THRESH_ALPHA) * smooth_th
 
     th = int(smooth_th)
-    _, binary = cv2.threshold(buf_masked, th, 255, cv2.THRESH_BINARY)
+    cv2.threshold(buf_masked, th, 255, cv2.THRESH_BINARY, dst=buf_th)
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+    # 全程形态学开运算：断开球与横向反光的粘连
+    cv2.morphologyEx(buf_th, cv2.MORPH_OPEN, morph_kernel,
+                     dst=buf_open, iterations=MORPH_ITERS)
+
+    contours, _ = cv2.findContours(buf_open, cv2.RETR_EXTERNAL,
                                     cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None, (0, 0, 0, 0), th, binary
+        return None, (0, 0, 0, 0), th, buf_open
 
     best_cnt, best_area = None, 0
     best_x = best_y = best_w = best_h = 0
@@ -168,16 +188,21 @@ def find_ball(img_np):
         if a < MIN_AREA or a > MAX_AREA:
             continue
         n_area += 1
-        # 贴边=贯穿ROI的条状物（槽壁），球贴边不会同时贴对边
-        edge_tb = (y <= 0 and y + h >= ROI_H - 1)
-        edge_lr = (x <= 0 and x + w >= ROI_W - 1)
-        if edge_tb or edge_lr:
-            continue
-        n_edge += 1
+        # 形状判断（面积>12才做，避免小噪点误判）
+        is_ball_shape = True
         if a > 12 and h > 0:
             aspect = float(w) / float(h)
             if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
+                is_ball_shape = False
+        # 贴边过滤：球形态的色块不杀（球贴边正常），只杀非球形态的贯穿条状物
+        if not is_ball_shape:
+            edge_tb = (y <= 0 and y + h >= ROI_H - 1)
+            edge_lr = (x <= 0 and x + w >= ROI_W - 1)
+            if edge_tb or edge_lr:
                 continue
+        n_edge += 1
+        if not is_ball_shape:
+            continue
         n_shape += 1
 
         if a > best_area:
@@ -187,13 +212,13 @@ def find_ball(img_np):
 
     stats = (len(contours), n_area, n_edge, n_shape)
     if best_cnt is None:
-        return None, stats, th, binary
+        return None, stats, th, buf_open
 
     cx = ROI_X + best_x + best_w // 2
     cy = ROI_Y + best_y + best_h // 2
     rx = ROI_X + best_x
     ry = ROI_Y + best_y
-    return (cx, cy, rx, ry, best_w, best_h, best_area), stats, th, binary
+    return (cx, cy, rx, ry, best_w, best_h, best_area), stats, th, buf_open
 
 
 try:
@@ -291,17 +316,48 @@ try:
         result, stats, th, binary_np = find_ball(img_np)
         raw_n, n_area, n_edge, n_shape = stats
 
+        # ---- 跳变过滤 ----
         if result is not None:
             ball_x, ball_y, rx, ry, rw, rh, area = result
-            offset_pct = (ball_x - GROOVE_CENTER_X) / HALF_WIDTH * 100.0
-            uart.write("[%.1f]" % offset_pct)
+            cur_pct = (ball_x - GROOVE_CENTER_X) / HALF_WIDTH * 100.0
 
-            img.draw_rectangle(rx, ry, rw, rh,
-                               color=(255, 255, 255), thickness=2)
-            img.draw_cross(ball_x, ball_y, color=(255, 255, 255),
-                           size=8, thickness=2)
+            accept = False
+            if last_valid_ball is None:
+                accept = True
+            else:
+                last_x, last_y, _ = last_valid_ball
+                if abs(ball_x - last_x) <= MAX_JUMP:
+                    accept = True
+                else:
+                    lost_count += 1
+                    if lost_count >= LOST_TIMEOUT:
+                        accept = True
+
+            if accept:
+                last_valid_ball = (ball_x, ball_y, cur_pct)
+                lost_count = 0
+                uart.write("[%.1f]" % cur_pct)
+        else:
+            if last_valid_ball is not None:
+                lost_count += 1
+                if lost_count >= LOST_TIMEOUT:
+                    last_valid_ball = None
+
+        # 显示用有效位置
+        if last_valid_ball is not None:
+            _, _, offset_pct = last_valid_ball
         else:
             offset_pct = 0.0
+
+        # ---- 画面叠加 ----
+        if last_valid_ball is not None:
+            lx, ly, _ = last_valid_ball
+            img.draw_cross(lx, ly, color=(255, 255, 255),
+                           size=8, thickness=2)
+        if result is not None:
+            _, _, rx, ry, rw, rh, _ = result
+            img.draw_rectangle(rx, ry, rw, rh,
+                               color=(255, 255, 255), thickness=2)
 
         img.draw_rectangle(ROI_X, ROI_Y, ROI_W, DETECT_ROI_H,
                            color=(0, 255, 0), thickness=2)
@@ -315,7 +371,7 @@ try:
 
         binary_img = image.Image(ROI_W, DETECT_ROI_H, image.GRAYSCALE,
                                  alloc=image.ALLOC_REF, data=binary_np)
-        label = "T:%d R%d>A%d>E%d>S%d" % (th, raw_n, n_area, n_edge, n_shape)
+        label = "T:%d OP(1,%d) R%d>A%d>E%d>S%d" % (th, MORPH_KSIZE, raw_n, n_area, n_edge, n_shape)
         show_frame(img, label, binary_img)
 
         fc += 1
